@@ -68,7 +68,7 @@ async function hashPassword(password, saltHex) {
     "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt, iterations: 150000 }, key, 256
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations: 100000 }, key, 256   // Workers 上限 100k
   );
   const hashHex = [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2, "0")).join("");
   const sHex = [...salt].map(b => b.toString(16).padStart(2, "0")).join("");

@@ -1,0 +1,5 @@
+# CORS 代理 worker（無綁定，最單純）
+# CI 用：wrangler deploy --config wrangler.proxy.toml
+name = "qdp-proxy"
+main = "worker.js"
+compatibility_date = "2024-09-01"

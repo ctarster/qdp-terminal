@@ -1,0 +1,52 @@
+name: Deploy Cloudflare Workers
+
+# 每次 push 到 main（且改到 worker 相關檔）就自動部署兩個 Worker。
+# 也可在 Actions 頁面手動觸發（workflow_dispatch）。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker.js"
+      - "api-worker.js"
+      - "wrangler.toml"
+      - "wrangler.proxy.toml"
+      - "schema.sql"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 沒設定 CLOUDFLARE_API_TOKEN 時不報錯，只跳過部署（首次 push 不會變紅叉）
+      - name: 檢查是否已設定 Cloudflare 金鑰
+        id: gate
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "$CF_TOKEN" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::尚未設定 CLOUDFLARE_API_TOKEN secret，略過 Worker 部署。請見 README 的 CI 設定。"
+          fi
+
+      # ① CORS 代理（qdp-proxy）— 無相依，永遠先部署
+      - name: Deploy 代理 (qdp-proxy)
+        if: steps.gate.outputs.ready == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config wrangler.proxy.toml
+
+      # ② 帳號 / 同步 API（qdp-api）— 需先在 wrangler.toml 填好 D1 database_id
+      - name: Deploy API (qdp-api)
+        if: steps.gate.outputs.ready == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config wrangler.toml

@@ -1,0 +1,15 @@
+# QDP API worker — Cloudflare Workers + D1
+# 部署：見 api-worker.js 檔頭步驟。重點：
+#   1. wrangler d1 create qdp-db   → 把 database_id 貼到下方
+#   2. wrangler d1 execute qdp-db --remote --file=./schema.sql
+#   3. wrangler secret put AUTH_SECRET
+#   4. wrangler deploy
+
+name = "qdp-api"
+main = "api-worker.js"
+compatibility_date = "2024-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "qdp-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"

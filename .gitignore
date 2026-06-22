@@ -1,0 +1,10 @@
+# 本機開發用，不需上傳
+.claude/
+.DS_Store
+Thumbs.db
+node_modules/
+.wrangler/
+
+# Cloudflare 機密（若你用 .dev.vars 存 AUTH_SECRET，務必別上傳）
+.dev.vars
+.env

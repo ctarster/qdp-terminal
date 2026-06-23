@@ -901,21 +901,34 @@ const STORE = { cfg:"qdp31_cfg", watch:"qdp31_watch", alerts:"qdp31_alerts", pre
  *   舊版 17 因子中 12 個是趨勢追隨型，反向訊號被稀釋 → 頂部仍報多
  *   exhaustion 在 RSI/BB/偏離 MA20 三重極值時給強反向訊號，平衡延續偏誤
  *   權重設高（0.11，全因子最高）— 因為極值反轉的歷史命中率優於單純趨勢追隨 */
+/* BASE_W v4.0 — 業界對齊再平衡（adaptiveWeights 會正規化，重點在相對比例）
+ *   依據：純價格震盪指標（rsi/kdj/bb/stochRsi/mfi/obv/vwapDev）彼此高度共線、
+ *         out-of-sample IC 低 → 大幅降權；
+ *         有實證 edge 的：中長期動能、籌碼/部位（台股）、相對強度、基本面 → 加權。
+ *   （IC 框架仍會依各股實際預測力再動態校準。）*/
 const BASE_W={
-  rsi:.04, macd:.06, kdj:.04, bb:.04, vol:.04, ma:.06, chip:.04, margin:.03,
-  adx:.04, obv:.04, stochRsi:.04, mfi:.04, mom20:.04, vwapDev:.04,
-  revenue:.03, eps:.03,
-  relStr:.06, chipStreak:.05,
-  exhaustion:.09,
-  candleRev:.05, chartPattern:.04,
-  gbm:.10            // 新增：Gradient Boosting 非線性因子（捕捉因子間交互）
+  // 純價格震盪指標（高度共線）— 降權
+  rsi:.02, kdj:.02, bb:.03, stochRsi:.01, mfi:.01, obv:.01, vwapDev:.02,
+  // 趨勢 / 動能
+  macd:.05, ma:.07, adx:.04, vol:.03, mom20:.04,
+  mom12_1:.09,   // 中長期動能（最穩健異常）
+  rev5:.04,      // 短期反轉
+  // 籌碼 / 部位（台股 edge）
+  chip:.06, margin:.04, chipStreak:.07, relStr:.07,
+  // 基本面（接 FinMind 真實資料）
+  revenue:.05, eps:.03, value:.05,
+  // 反向 / 型態
+  exhaustion:.08, candleRev:.03, chartPattern:.02,
+  // 非線性
+  gbm:.10
 };
 const FACTOR_LABELS={
   rsi:"RSI動能",     macd:"MACD趨勢",    kdj:"KDJ震盪",    bb:"布林位置",
   vol:"量價能量",    ma:"均線結構",      chip:"三大法人",  margin:"融資融券",
   adx:"ADX趨勢力",  obv:"OBV能量",      stochRsi:"隨機RSI", mfi:"資金流向",
-  mom20:"20日動能",  vwapDev:"VWAP偏離", revenue:"月營收",  eps:"EPS趨勢",
+  mom20:"20日動能",  vwapDev:"VWAP偏離", revenue:"月營收YoY",  eps:"EPS YoY",
   relStr:"大盤相對強度", chipStreak:"法人連續同向",
+  mom12_1:"中長期動能(12-1)", rev5:"短期反轉(5日)", value:"估值(低PBR)",
   exhaustion:"趨勢衰竭反向",
   candleRev:"K線反轉型態", chartPattern:"圖形型態",
   gbm:"梯度提升 (GBM)"
@@ -1875,9 +1888,20 @@ function factorSignalsAt(rows,i,ext={}){
   // VWAP 偏離
   const vwapV=sn(r.vwap);
   sig.vwapDev=vwapV>0?clamp((sn(r.close)-vwapV)/vwapV*30,-1,1):0;
-  // 月營收 / EPS：外部資料，無資料時中性
+  /* mom12_1 — 中長期動能（跳過最近 ~1 個月、取 ~12 個月報酬）
+     業界最穩健的時序異常（Jegadeesh-Titman / Moskowitz）；純價格、回測即可計算 */
+  const MOM_L=240, MOM_G=20;
+  if(i>MOM_L){
+    const past=sn(rows[i-MOM_L].close), recent=sn(rows[i-MOM_G].close);
+    sig.mom12_1=(past>0&&recent>0)?clamp((recent/past-1)/0.40,-1,1):0;
+  } else sig.mom12_1=0;
+  /* rev5 — 短期反轉（近 5 日漲多→偏空、跌多→偏多，均值回歸） */
+  const p5=sn(rows[Math.max(0,i-5)].close);
+  sig.rev5=(p5>0)?clamp(-((sn(r.close)/p5-1))/0.10,-1,1):0;
+  // 月營收 YoY / EPS YoY / 估值：外部基本面資料（fetchFundamentals），無資料時中性
   sig.revenue=clamp(sn(ext.revenueGrowth,0),-1,1);
   sig.eps=clamp(sn(ext.epsGrowth,0),-1,1);
+  sig.value=clamp(sn(ext.valueSignal,0),-1,1);   // 低 PBR/PER 分位 = 偏多（Value）
 
   /* ── exhaustion（趨勢衰竭）— 核心反向訊號 ──
    *   修復多因子模型「頂部仍報多 / 底部仍報空」的結構性缺陷。
@@ -2054,7 +2078,7 @@ function adaptiveWeights(rows,ext={},lookback=120){
  *   記憶體（session）：盤中 tick 直接命中，無延遲
  *   localStorage：跨日 reload 後沿用昨日校準（除非樣本長度變化大或超過 7 天）
  *   持久化讓「模型自我適應」可以累積 — 非揮發、每日盤後自動更新 */
-const STORE_IC = "qdp38_ic_weights";
+const STORE_IC = "qdp40_ic_weights";   // v4.0 因子集變更 → 換 key，舊權重快取失效重算
 function _getStoredIC(stockId, tf){
   try{
     const all=JSON.parse(localStorage.getItem(STORE_IC)||"{}");
@@ -2245,7 +2269,7 @@ function predictGBMScore(model, sig){
      • 你看過越多股票，模型越準，不必每檔各自從零累積
    儲存：localStorage（樣本池上限 2500 筆 FIFO；池每多 200 筆才重訓一次）
 ═══════════════════════════════════════════════════════════════ */
-const STORE_POOL="qdp_pool_v1";
+const STORE_POOL="qdp_pool_v2";   // v4.0 新因子集 → 重建池
 const POOL_MAX=2500;
 let _marketGBM=null, _marketGBMPoolN=0, _poolDirty=true;
 
@@ -2280,7 +2304,7 @@ function getMarketGBM(){
 }
 
 /* 個股 GBM 模型持久化（重載免重訓）── 修「等待訓練」 */
-const STORE_GBM="qdp_gbm_v1";
+const STORE_GBM="qdp_gbm_v2";   // v4.0 新因子集 → 重訓
 function _loadGBM(stockId,tf,rowsLen){
   try{
     const all=JSON.parse(localStorage.getItem(STORE_GBM)||"{}");
@@ -3086,6 +3110,62 @@ async function fetchMargin(id){
     return {date:last.date,marginBal:mb,marginDelta:mb-mp,shortBal:sb,shortRatio:mb>0?(sb/mb)*100:0};
   }catch{return null;}
 }
+
+/* fetchFundamentals — 真實基本面（FinMind）：月營收 YoY、估值(PBR 歷史分位)、EPS YoY
+ *   回傳已正規化訊號（約 [-1,1]）；任一來源失敗則該項中性 0。三項並行抓，省時間。 */
+async function fetchFundamentals(id){
+  const out={revenueGrowth:0, epsGrowth:0, valueSignal:0, _meta:{}};
+  // 月營收 YoY
+  const getRevenue=async()=>{
+    const s=new Date(); s.setMonth(s.getMonth()-15);
+    const res=await fetchRetry(fmUrl("TaiwanStockMonthRevenue",{data_id:id,start_date:dateKey(s)}),{},10000,1);
+    if(!res?.ok) return; const j=await res.json();
+    if(j.msg!=="success"||!j.data?.length) return;
+    const rows=j.data.slice().sort((a,b)=>(a.revenue_year*100+a.revenue_month)-(b.revenue_year*100+b.revenue_month));
+    const last=rows[rows.length-1];
+    const yoyPrev=rows.find(r=>r.revenue_year===last.revenue_year-1 && r.revenue_month===last.revenue_month);
+    if(last && yoyPrev && sn(yoyPrev.revenue)>0){
+      const yoy=(sn(last.revenue)-sn(yoyPrev.revenue))/sn(yoyPrev.revenue);
+      out.revenueGrowth=clamp(yoy/0.25,-1,1);
+      out._meta.revYoY=yoy; out._meta.revMonth=`${last.revenue_year}/${last.revenue_month}`;
+    }
+  };
+  // 估值：PBR 在自身 2 年歷史的分位（低=便宜=偏多）
+  const getValue=async()=>{
+    const s=new Date(); s.setFullYear(s.getFullYear()-2);
+    const res=await fetchRetry(fmUrl("TaiwanStockPER",{data_id:id,start_date:dateKey(s)}),{},10000,1);
+    if(!res?.ok) return; const j=await res.json();
+    if(j.msg!=="success"||!j.data?.length) return;
+    const pbrs=j.data.map(r=>sn(r.PBR)).filter(v=>Number.isFinite(v)&&v>0);
+    if(pbrs.length>=30){
+      const cur=pbrs[pbrs.length-1];
+      const pct=pbrs.filter(v=>v<cur).length/pbrs.length;   // 當前 PBR 的歷史分位
+      out.valueSignal=clamp((0.5-pct)*2,-1,1);
+      out._meta.pbr=cur; out._meta.pbrPct=pct;
+    }
+  };
+  // EPS YoY（季財報）
+  const getEPS=async()=>{
+    const s=new Date(); s.setFullYear(s.getFullYear()-2);
+    const res=await fetchRetry(fmUrl("TaiwanStockFinancialStatements",{data_id:id,start_date:dateKey(s)}),{},10000,1);
+    if(!res?.ok) return; const j=await res.json();
+    if(j.msg!=="success"||!j.data?.length) return;
+    const eps=j.data.filter(r=>String(r.type)==="EPS"||/每股盈餘/.test(r.origin_name||""))
+                    .sort((a,b)=>String(a.date).localeCompare(String(b.date)));
+    if(eps.length>=5){
+      const last=sn(eps[eps.length-1].value), prevYr=sn(eps[eps.length-5].value);   // 4 季前=去年同季
+      if(Math.abs(prevYr)>0.01){
+        const yoy=(last-prevYr)/Math.abs(prevYr);
+        out.epsGrowth=clamp(yoy/0.5,-1,1); out._meta.epsYoY=yoy;
+      }
+    }
+  };
+  await Promise.allSettled([getRevenue(),getValue(),getEPS()]);
+  const m=out._meta;
+  try{ appendLog(`基本面：營收YoY ${m.revYoY!=null?(m.revYoY*100).toFixed(0)+"%":"—"} ｜ PBR分位 ${m.pbrPct!=null?(m.pbrPct*100).toFixed(0)+"%":"—"} ｜ EPS YoY ${m.epsYoY!=null?(m.epsYoY*100).toFixed(0)+"%":"—"}`); }catch{}
+  return out;
+}
+
 async function callGroq(prompt){
   const cfg=loadCfg();if(!cfg.groqKey) return null;
   try{
@@ -3725,8 +3805,8 @@ async function loadStock(id,opts={}){
   setFetchStatus("busy");
 
   try{
-    const [histR,liveR,chipR,marginR,twiiR]=await Promise.allSettled([
-      fetchHistory(id),fetchTWSELive(id),fetchInstitutional(id),fetchMargin(id),fetchTWII()
+    const [histR,liveR,chipR,marginR,twiiR,fundR]=await Promise.allSettled([
+      fetchHistory(id),fetchTWSELive(id),fetchInstitutional(id),fetchMargin(id),fetchTWII(),fetchFundamentals(id)
     ]);
     if(token!==S.loadToken){setLoader(false);return;}
 
@@ -3736,6 +3816,7 @@ async function loadStock(id,opts={}){
     S.chips=chipR.status==="fulfilled"?chipR.value:null;
     S.margin=marginR.status==="fulfilled"?marginR.value:null;
     S.twiiRows=twiiR.status==="fulfilled"?twiiR.value:null;
+    S.fundamentals=fundR.status==="fulfilled"?fundR.value:null;
     const live=liveR.status==="fulfilled"?liveR.value:null;
 
     if(live?.name) S.stockName=live.name.replace(/\s+/g,"");
@@ -3804,7 +3885,10 @@ function computeConfluence(){
     shortRatio:S.margin?S.margin.shortRatio:0,
     foreignStreak:S.chips?.foreignStreak||0,
     trustStreak  :S.chips?.trustStreak||0,
-    dealerStreak :S.chips?.dealerStreak||0
+    dealerStreak :S.chips?.dealerStreak||0,
+    revenueGrowth:S.fundamentals?.revenueGrowth||0,
+    epsGrowth:S.fundamentals?.epsGrowth||0,
+    valueSignal:S.fundamentals?.valueSignal||0
   };
   let scoreD=NaN,scoreW=NaN;
   try{
@@ -3902,7 +3986,11 @@ function applyTimeframe(forceRebuild=false,mode='full'){
     trustStreak  :S.chips?.trustStreak||0,
     dealerStreak :S.chips?.dealerStreak||0,
     // 個股 vs 加權指數 5 日相對報酬
-    relReturn5: calcRelReturn(S.enriched, S.twiiRows, 5)
+    relReturn5: calcRelReturn(S.enriched, S.twiiRows, 5),
+    // 基本面（fetchFundamentals）：月營收 YoY / EPS YoY / 估值分位
+    revenueGrowth:S.fundamentals?.revenueGrowth||0,
+    epsGrowth:S.fundamentals?.epsGrowth||0,
+    valueSignal:S.fundamentals?.valueSignal||0
   };
   const liveP=S.liveQuote?S.liveQuote.price:S.enriched[S.enriched.length-1].close;
   S.pred=predictNext(S.enriched,liveP,ext);

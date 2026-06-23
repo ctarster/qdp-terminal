@@ -2584,10 +2584,80 @@ function updateArchive(stockId,tf,latestRow,pred){
 function calcArchiveStats(stockId,tf){
   const key=`${stockId}_${tf}`,db=getPredArchive();
   const arr=(db[key]||[]).filter(x=>Number.isFinite(x.actual_close));
-  if(!arr.length) return {hitRate:0,avgErr:0,n:0};
+  if(!arr.length) return {hitRate:0,avgErr:0,n:0,nLive:0,nBackfill:0};
   const hits=arr.filter(x=>x.hit).length;
   const avgErr=arr.reduce((a,b)=>a+sn(b.abs_err),0)/arr.length;
-  return {hitRate:hits/arr.length,avgErr,n:arr.length};
+  const nBackfill=arr.filter(x=>x.bf).length;
+  return {hitRate:hits/arr.length,avgErr,n:arr.length,nLive:arr.length-nBackfill,nBackfill};
+}
+
+/* ════════════════════════════════════════════════════════════
+   歷史回填驗證（Backfill）— 修「模型驗證要等很久」
+   ────────────────────────────────────────────────────────────
+   不必每天等 1 筆累積：直接用已抓回的 2 年歷史「重演」過去每一天，
+   每天用「只看當天以前」訓練的凍結模型預測隔日方向，對照實際結果。
+   一次產生數百筆 out-of-sample 驗證 → 命中率立刻有意義。
+   做法與 runBacktest 完全同源（凍結權重 + 凍結 GBM，ext={} 不洩漏當期籌碼），
+   確保不偷看未來。回填的紀錄標記 bf:true，不覆蓋實盤寫入的紀錄。
+═══════════════════════════════════════════════════════════════ */
+const _backfillDone=new Set();   // session 內每個 stock|tf 只回填一次
+function backfillArchiveFromHistory(stockId, tf, rows, testBars=120){
+  if(!rows || rows.length<120) return 0;
+  const end=rows.length-1;                       // 需要 rows[i+1] 當實際值
+  const testStart=Math.max(80, rows.length-testBars-1);
+  if(testStart>=end) return 0;
+  // 凍結模型：只用 testStart 之前的資料訓練（無 look-ahead），ext={} 與回測一致
+  const frozenW=adaptiveWeights(rows.slice(0,testStart),{},120);
+  const wKeys=Object.keys(frozenW);
+  const frozenGBM=trainGBMOnStock(rows,{},120,testStart);
+  const key=`${stockId}_${tf}`, db=getPredArchive();
+  const arr=db[key]||[];
+  const haveDates=new Set(arr.map(x=>x.date));
+  let added=0;
+  for(let i=testStart;i<end;i++){
+    const cur=rows[i], nxt=rows[i+1];
+    if(!cur||!nxt?.close) continue;
+    if(haveDates.has(cur.time)) continue;        // 不覆蓋既有（含實盤）
+    const atr=Math.max(0.01,sn(cur.atr,cur.close*0.02));
+    const sig=factorSignalsAt(rows,i,{});
+    sig.gbm=predictGBMScore(frozenGBM,sig);
+    let rawScore=0; for(const n of wKeys) rawScore+=sn(sig[n],0)*frozenW[n];
+    // Regime Override（與 predictNext / runBacktest 同步）
+    const exh=sn(sig.exhaustion,0), absExh=Math.abs(exh);
+    const trendStr=Math.min(1,Math.abs(sn(cur.hist,0))/(atr*0.8)); const damper=1-trendStr*0.4;
+    let score=rawScore;
+    if(absExh>=0.80){const b=0.60*damper;score=rawScore*(1-b)+exh*b;}
+    else if(absExh>=0.55){const b=0.30*damper;score=rawScore*(1-b)+exh*b;}
+    else if(absExh>=0.30){score=rawScore*0.80+exh*0.10*damper;}
+    const evClose=cur.close+score*atr*(0.55+Math.abs(score)*1.35);
+    const actualClose=sn(nxt.close);
+    const predDir=sign(score), actualDir=sign(actualClose-cur.close);
+    arr.push({
+      date:cur.time, base_close:sn(cur.close), pred_close:evClose, pred_dir:predDir,
+      confidence: clamp(40+(100*(1-Math.exp(-3.5*Math.abs(score))))*0.45,35,95),
+      actual_close:actualClose, actual_dir:actualDir,
+      hit: predDir===actualDir,
+      abs_err: Math.abs(evClose-actualClose)/Math.max(.01,cur.close),
+      bf:true
+    });
+    added++;
+  }
+  if(added){
+    arr.sort((a,b)=>String(a.date).localeCompare(String(b.date)));
+    db[key]=arr.slice(-200);
+    setPredArchive(db);
+    appendLog(`模型歷史回填：${stockId} ${tf} 新增 ${added} 筆即時驗證`);
+  }
+  return added;
+}
+/* 只在驗證樣本太少時回填一次（避免每次載入重算） */
+function maybeBackfillArchive(stockId, tf, rows){
+  const ck=`${stockId}|${tf}`;
+  if(_backfillDone.has(ck)) return;
+  _backfillDone.add(ck);
+  const cur=calcArchiveStats(stockId,tf);
+  if(cur.n>=60) return;          // 已有足夠驗證樣本就不回填
+  try{ backfillArchiveFromHistory(stockId, tf, rows); }catch(e){ console.warn("[QDP][backfill]",e); }
 }
 
 /* ── 時框聚合 ── */
@@ -3493,7 +3563,12 @@ function renderArchive(){
   $("hitRate").textContent=s.n?(s.hitRate*100).toFixed(1)+"%":"---";
   $("avgErr").textContent=s.n?(s.avgErr*100).toFixed(2)+"%":"---";
   $("verifiedN").textContent=s.n+" 筆";
-  $("archive-text").textContent=s.n?`${s.n} 筆已驗證，方向命中率 ${(s.hitRate*100).toFixed(1)}%，平均收盤誤差 ${(s.avgErr*100).toFixed(2)}%。`:"尚未累積足夠驗證資料，每日盤後重新整理即可累積。";
+  const src = (s.nBackfill||0)>0
+    ? `（歷史回測 ${s.nBackfill} + 實盤 ${s.nLive||0} 筆）`
+    : `（實盤 ${s.nLive||s.n} 筆）`;
+  $("archive-text").textContent = s.n
+    ? `${s.n} 筆已驗證 ${src}，方向命中率 ${(s.hitRate*100).toFixed(1)}%，平均收盤誤差 ${(s.avgErr*100).toFixed(2)}%。歷史回測為「只看當日以前」的凍結模型逐日重演（不偷看未來），故載入即有命中率，不必等每日累積。`
+    : "驗證資料計算中…";
 }
 function renderBacktest(){
   const b=S.backtest,badge=$.real("bt-badge");
@@ -3836,6 +3911,7 @@ function applyTimeframe(forceRebuild=false,mode='full'){
     const cfg=loadCfg();
     S.backtest=runBacktest(S.enriched,cfg.btBars);
     if(S.timeframe==="D"&&S.pred) updateArchive(S.stockId,"D",S.enriched[S.enriched.length-1],S.pred);
+    maybeBackfillArchive(S.stockId,S.timeframe,S.enriched);   // 歷史回填：驗證不用等
     S.archiveStats=calcArchiveStats(S.stockId,S.timeframe);
   }
 

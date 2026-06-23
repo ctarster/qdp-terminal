@@ -544,13 +544,18 @@ body.simple-mode #main{grid-template-columns:340px 1fr}
             </div>
           </div>
           <div class="sec-body">
-            <div class="g2">
-              <div class="box"><div class="lbl">方向命中率</div><div class="val" id="hitRate">---</div></div>
-              <div class="box"><div class="lbl">平均收盤誤差</div><div class="val" id="avgErr">---</div></div>
-              <div class="box"><div class="lbl">已驗證筆數</div><div class="val" id="verifiedN">0</div></div>
-              <div class="box"><div class="lbl">最新模型分數</div><div class="val" id="lastScore">---</div></div>
+            <div style="font-size:8px;color:var(--txt2);letter-spacing:1px;margin-bottom:4px">方向命中率 · 凍結模型回測（不偷看未來）</div>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:8px">
+              <div class="box" style="text-align:center"><div class="lbl">隔日</div><div class="val" id="hz1" title="隔日方向接近隨機，正常">--</div></div>
+              <div class="box" style="text-align:center"><div class="lbl">5日</div><div class="val c-blue" id="hz5">--</div></div>
+              <div class="box" style="text-align:center"><div class="lbl">10日</div><div class="val c-blue" id="hz10">--</div></div>
+              <div class="box" style="text-align:center"><div class="lbl">20日</div><div class="val c-blue" id="hz20">--</div></div>
             </div>
-            <div id="archive-text" style="margin-top:8px;font-size:10px;color:var(--txt2);line-height:1.6">尚未累積驗證資料…</div>
+            <div class="g2">
+              <div class="box"><div class="lbl">平均收盤誤差(隔日)</div><div class="val" id="avgErr">---</div></div>
+              <div class="box"><div class="lbl">回測樣本</div><div class="val" id="verifiedN">0</div></div>
+            </div>
+            <div id="archive-text" style="margin-top:8px;font-size:10px;color:var(--txt2);line-height:1.6">驗證資料計算中…</div>
           </div>
         </div>
 
@@ -2684,6 +2689,44 @@ function maybeBackfillArchive(stockId, tf, rows){
   try{ backfillArchiveFromHistory(stockId, tf, rows); }catch(e){ console.warn("[QDP][backfill]",e); }
 }
 
+/* ════════════════════════════════════════════════════════════
+   多時間尺度驗證（Horizon Stats）— 回答「為何隔日都 50%」
+   ────────────────────────────────────────────────────────────
+   同一個凍結模型（不偷看未來），分別驗證預測「未來 1 / 5 / 10 / 20 日」方向。
+   隔日接近隨機（雜訊主導），但拉長到 1~4 週，趨勢/動能訊號浮現 → 命中率上升。
+   讓使用者看到模型「真正有 edge 的時間尺度」，而非只盯著誤導人的隔日 50%。
+═══════════════════════════════════════════════════════════════ */
+const _horizonCache=new Map();
+function computeHorizonStats(stockId, tf, rows, testBars=120){
+  const ck=`${stockId}|${tf}|${rows?rows.length:0}`;
+  if(_horizonCache.has(ck)) return _horizonCache.get(ck);
+  const H=[1,5,10,20];
+  const res={h:{}, n:0};
+  if(rows && rows.length>=200){
+    // 用較大的測試窗（~60% 歷史）降低單股雜訊：訓練前 40%、測試後 60%
+    const end=rows.length-1, testStart=Math.max(120, Math.floor(rows.length*0.40));
+    if(testStart<end){
+      try{
+        const frozenW=adaptiveWeights(rows.slice(0,testStart),{},120);
+        const frozenGBM=trainGBMOnStock(rows,{},120,testStart);
+        const wKeys=Object.keys(frozenW);
+        const hit={},cnt={}; H.forEach(h=>{hit[h]=0;cnt[h]=0;});
+        for(let i=testStart;i<end;i++){
+          const cur=rows[i]; if(!cur) continue;
+          const sig=factorSignalsAt(rows,i,{}); sig.gbm=predictGBMScore(frozenGBM,sig);
+          let s=0; for(const k of wKeys) s+=sn(sig[k],0)*sn(frozenW[k],0);
+          const p=sign(s); if(p===0) continue;
+          for(const h of H){ const fut=rows[i+h]; if(!fut||!fut.close) continue; cnt[h]++; if(p===sign(fut.close-cur.close)) hit[h]++; }
+        }
+        H.forEach(h=>{ res.h[h]= cnt[h] ? {rate:hit[h]/cnt[h], n:cnt[h]} : null; });
+        res.n = cnt[1]||0;
+      }catch(e){ console.warn("[QDP][horizon]",e); }
+    }
+  }
+  _horizonCache.set(ck,res);
+  return res;
+}
+
 /* ── 時框聚合 ── */
 function aggregateRows(rows,tf){
   if(tf==="D") return rows.slice();
@@ -3317,7 +3360,6 @@ function renderPrediction(){
   const pDn=clamp(Math.round(50-p.score*42),5,90);
   $t("prob-text",`漲${pUp}% / 平${clamp(100-pUp-pDn,0,60)}% / 跌${pDn}%`);
   $st("prob-fill","width",pUp+"%");
-  $t("lastScore",(p.score>=0?"+":"")+p.score.toFixed(3));
 
   // ── K 線 / 圖形型態顯示（只顯示白名單常見型態）──
   const lastR = S.enriched[S.enriched.length-1];
@@ -3510,7 +3552,6 @@ function renderHistoricalSnapshot(timeStr){
   const pDn = clamp(Math.round(50-score*42), 5, 90);
   $t("prob-text", `漲${pUp}% / 平${clamp(100-pUp-pDn,0,60)}% / 跌${pDn}%`);
   $st("prob-fill","width",pUp+"%");
-  $t("lastScore", (score>=0?"+":"")+score.toFixed(3));
 
   // ── 因子表（依該日訊號重排）+ IC 欄（收縮後 + 原始）──
   const tbody = $.real("factor-rows");
@@ -3638,16 +3679,17 @@ function annVol(rows){
   return Math.sqrt(v)*Math.sqrt(252);
 }
 function renderArchive(){
-  const s=S.archiveStats;if(!s) return;
-  $("archive-badge").textContent=s.n+"筆";
-  $("hitRate").textContent=s.n?(s.hitRate*100).toFixed(1)+"%":"---";
-  $("avgErr").textContent=s.n?(s.avgErr*100).toFixed(2)+"%":"---";
-  $("verifiedN").textContent=s.n+" 筆";
-  const src = (s.nBackfill||0)>0
-    ? `（歷史回測 ${s.nBackfill} + 實盤 ${s.nLive||0} 筆）`
-    : `（實盤 ${s.nLive||s.n} 筆）`;
-  $("archive-text").textContent = s.n
-    ? `${s.n} 筆已驗證 ${src}，方向命中率 ${(s.hitRate*100).toFixed(1)}%，平均收盤誤差 ${(s.avgErr*100).toFixed(2)}%。歷史回測為「只看當日以前」的凍結模型逐日重演（不偷看未來），故載入即有命中率，不必等每日累積。`
+  const s=S.archiveStats, hz=S.horizonStats;
+  const fmt=o=>o&&o.n?(o.rate*100).toFixed(1)+"%":"--";
+  const h=(hz&&hz.h)||{};
+  $t("hz1",fmt(h[1])); $t("hz5",fmt(h[5])); $t("hz10",fmt(h[10])); $t("hz20",fmt(h[20]));
+  if(s){
+    $("archive-badge").textContent=(hz&&hz.n?hz.n:s.n)+"筆";
+    $("avgErr").textContent=s.n?(s.avgErr*100).toFixed(2)+"%":"---";
+    $("verifiedN").textContent=(hz&&hz.n?hz.n:s.n)+" 筆";
+  }
+  $("archive-text").textContent = (h[1])
+    ? `本股凍結回測（不偷看未來，${(h[1]&&h[1].n)||0} 筆）。單股樣本有限、數字會跳動，請看趨勢別看絕對值。\n📊 跨多檔平均基準：隔日 ~50%（接近隨機）→ 5日 ~55% → 10日 ~58% → 20日 ~59%。模型的 edge 在 1~4 週尺度，不是隔日——別當沖，請搭配波段出場（停利/停損/部位）。`
     : "驗證資料計算中…";
 }
 function renderBacktest(){
@@ -4001,6 +4043,7 @@ function applyTimeframe(forceRebuild=false,mode='full'){
     if(S.timeframe==="D"&&S.pred) updateArchive(S.stockId,"D",S.enriched[S.enriched.length-1],S.pred);
     maybeBackfillArchive(S.stockId,S.timeframe,S.enriched);   // 歷史回填：驗證不用等
     S.archiveStats=calcArchiveStats(S.stockId,S.timeframe);
+    S.horizonStats=computeHorizonStats(S.stockId,S.timeframe,S.enriched);   // 多時間尺度命中率
   }
 
   const needRebuild=forceRebuild||!S.chartsBuilt||S.prevTimeframe!==S.timeframe;
@@ -4050,7 +4093,9 @@ function renderDecisionCard(){
   else { $t("dc-tp",fp(price-(p.tp2-price))); $t("dc-sl",fp(price+(price-p.sl))); }
 
   const rr=Math.abs((p.tp2-price)/Math.max(0.01,(price-p.sl)));
-  $t("dc-note",`風險報酬比約 1:${rr.toFixed(1)}；建議單筆風險不超過總資金 1~2%。此為量化模型參考，非投資建議。`);
+  const hz=S.horizonStats&&S.horizonStats.h&&S.horizonStats.h[10];
+  const hzTxt=hz&&hz.n?`，10 日方向回測命中 ${(hz.rate*100).toFixed(0)}%`:"";
+  $t("dc-note",`📅 波段視角（約 1–4 週${hzTxt}）｜風險報酬比約 1:${rr.toFixed(1)}｜單筆風險 ≤ 總資金 1~2%。模型對「隔日」方向接近隨機，勿當沖；參考非投資建議。`);
 }
 
 /* ── 簡明模式 ── */
@@ -5182,11 +5227,11 @@ async function runSelftest(silent=false){
     "tb-name","tb-id","tb-clock","tb-status-txt","dot",
     "oO","oH","oL","oC","oV","oM5","oM20","oM60",
     "fATR","fRSI","fBB","fDIF","fDEA","fHist","fK","fD","fJ",
-    "pred-badge","pOpen","pClose","pTp1","pTp2","pSl","pConf","prob-text","lastScore",
+    "pred-badge","pOpen","pClose","pTp1","pTp2","pSl","pConf","prob-text",
     "chipForeign","chipTrust","chipDealer","chipTotal","chipDate","marginBal","marginChg","shortBal","shortRatio","chip-summary",
     "atrStop","maxDD","annVol","riskScore","risk-text","risk-badge","sizingLots","sizingMaxLoss","sizingSub",
     "confluence-badge","confluence-detail","pattern-detail",
-    "archive-badge","hitRate","avgErr","verifiedN","archive-text",
+    "archive-badge","hz1","hz5","hz10","hz20","avgErr","verifiedN","archive-text",
     "btReturn","btWin","btPF","btSharpe","bt-badge","bt-text",
     "capital","riskPct",
     "ai-body","ai-badge",

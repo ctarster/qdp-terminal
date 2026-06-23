@@ -4,7 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>QDP PRO v3.2 — 機構級量化終端</title>
-<script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+<script defer src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap');
 
@@ -673,9 +673,10 @@ body.simple-mode #main{grid-template-columns:340px 1fr}
             <span class="sec-badge t-blue" id="wl-count">0</span>
           </div>
           <div class="inp-row">
-            <input id="wlInput" type="text" placeholder="代號" style="width:72px;font-family:var(--mono)">
+            <input id="wlInput" type="text" placeholder="代號" style="width:60px;font-family:var(--mono)">
             <button class="tb-btn primary" id="wlAddBtn">加入</button>
             <button class="tb-btn" id="wlRefreshBtn">刷新</button>
+            <button class="tb-btn" id="wlRankBtn" title="橫斷面排序：用共同權重＋市場模型把自選股互相比強弱，選相對最強的">⇅ 排名</button>
           </div>
           <div id="watchList"></div>
         </div>
@@ -1011,7 +1012,7 @@ const S = {
   w52high:null, w52low:null,
   pred:null, backtest:null, archiveStats:null, fundamentals:null,
   charts:{}, series:{}, resizeObs:null, pivotLines:[],
-  intervals:new Set(), timers:new Set(), loadToken:0,        // timers: 追蹤 setTimeout，與 setInterval 分離
+  intervals:new Set(), timers:new Set(), loadToken:0, _validateToken:0,   // timers: 追蹤 setTimeout，與 setInterval 分離；_validateToken: 延後重運算的防過期戳記
   watchInflight:false, prevTimeframe:null,
   chartsBuilt:false, logCount:0,
   // ── 機構級效能快取（盤中熱路徑用）──
@@ -4039,11 +4040,23 @@ function applyTimeframe(forceRebuild=false,mode='full'){
 
   if(mode!=='tick'){
     const cfg=loadCfg();
-    S.backtest=runBacktest(S.enriched,cfg.btBars);
-    if(S.timeframe==="D"&&S.pred) updateArchive(S.stockId,"D",S.enriched[S.enriched.length-1],S.pred);
-    maybeBackfillArchive(S.stockId,S.timeframe,S.enriched);   // 歷史回填：驗證不用等
-    S.archiveStats=calcArchiveStats(S.stockId,S.timeframe);
-    S.horizonStats=computeHorizonStats(S.stockId,S.timeframe,S.enriched);   // 多時間尺度命中率
+    S.archiveStats=calcArchiveStats(S.stockId,S.timeframe);   // 輕量：先給初值
+    /* 重運算（runBacktest / backfill / horizon 各含 GBM 訓練）延後到首屏渲染後，
+       用 requestIdleCallback 避免載入時主執行緒卡頓；vToken 防止過期覆蓋。 */
+    const vTok=++S._validateToken;
+    const stk=S.stockId, tf=S.timeframe, rows=S.enriched, pred=S.pred, bt=cfg.btBars;
+    (window.requestIdleCallback||(f=>setTimeout(f,60)))(()=>{
+      if(vTok!==S._validateToken) return;   // 已被新載入 / 時框切換取代
+      try{
+        S.backtest=runBacktest(rows,bt);
+        if(tf==="D"&&pred) updateArchive(stk,"D",rows[rows.length-1],pred);
+        maybeBackfillArchive(stk,tf,rows);
+        S.archiveStats=calcArchiveStats(stk,tf);
+        S.horizonStats=computeHorizonStats(stk,tf,rows);
+      }catch(e){ console.warn("[QDP][validate]",e); }
+      if(vTok!==S._validateToken) return;
+      renderBacktest(); renderArchive(); renderDecisionCard();
+    },{timeout:1500});
   }
 
   const needRebuild=forceRebuild||!S.chartsBuilt||S.prevTimeframe!==S.timeframe;
@@ -4383,6 +4396,58 @@ function addAlert(){
   try{if("Notification" in window&&Notification.permission==="default")Notification.requestPermission();}catch{}
 }
 
+/* ════════════════════════════════════════════════════════════
+   橫斷面排序（Cross-Sectional Ranking）— 業界正解用法
+   ────────────────────────────────────────────────────────────
+   不是單檔絕對擇時，而是把自選股「互相比強弱」、選相對最強的幾檔。
+   為求可比較：用「共同權重」(正規化 BASE_W) ＋ 市場通用 GBM ＋ 相對大盤強度，
+   而非各股自己的 IC 權重（那會讓分數不可比）。
+═══════════════════════════════════════════════════════════════ */
+function _normWeights(W){ let t=0; for(const k in W) t+=W[k]; const o={}; for(const k in W) o[k]=W[k]/(t||1); return o; }
+const _CS_W=_normWeights(BASE_W);
+/* scoreStockCS — 對單檔算「可跨股比較」的分數（不動用 S 狀態，純函數） */
+function scoreStockCS(enr){
+  if(!enr||enr.length<60) return null;
+  const i=enr.length-1, last=enr[i];
+  const ext={ relReturn5: calcRelReturn(enr, S.twiiRows, 5) };   // 相對大盤強度（大盤對所有股相同）
+  const sig=factorSignalsAt(enr,i,ext);
+  sig.gbm=predictGBMScore(getMarketGBM(), sig);
+  let raw=0; for(const k in _CS_W) raw+=sn(sig[k],0)*_CS_W[k];
+  // Regime Override（與 predictNext 同步）
+  const atr=Math.max(0.01,sn(last.atr,last.close*0.02));
+  const exh=sn(sig.exhaustion,0), aE=Math.abs(exh);
+  const tS=Math.min(1,Math.abs(sn(last.hist,0))/(atr*0.8)), dp=1-tS*0.4;
+  let score=raw;
+  if(aE>=0.80){const b=0.6*dp;score=raw*(1-b)+exh*b;}
+  else if(aE>=0.55){const b=0.3*dp;score=raw*(1-b)+exh*b;}
+  else if(aE>=0.30){score=raw*0.8+exh*0.10*dp;}
+  return score;
+}
+async function rankWatchlist(){
+  const list=getWatchlist();
+  if(!list.length){ toast("自選清單為空","err"); return; }
+  const btn=$.real("wlRankBtn"); if(btn){ btn.textContent="排名中…"; btn.disabled=true; }
+  toast("橫斷面排名計算中…","ok");
+  getMarketGBM();   // 確保市場模型就緒
+  const scores={};
+  for(const item of list){
+    try{
+      let enr;
+      if(item.id===S.stockId && S.enriched.length) enr=S.enriched;   // 當前股直接用，省一次抓取
+      else enr=enrichRows(await fetchHistory(item.id));
+      const sc=scoreStockCS(enr);
+      if(sc!=null) scores[item.id]=sc;
+    }catch(e){ console.warn("[QDP][rank]",item.id,e); }
+    await sleep(120);
+  }
+  S.wlScores=scores; S.wlRankMode=true;
+  if(btn){ btn.textContent="⇅ 排名"; btn.disabled=false; }
+  renderWatchlist();
+  const ranked=Object.keys(scores).length;
+  appendLog(`橫斷面排名完成：${ranked}/${list.length} 檔`);
+  toast(ranked?`已依強弱排序 ${ranked} 檔`:"無足夠資料排名", ranked?"ok":"err");
+}
+
 /* ── 自選清單 ── */
 async function renderWatchlist(){
   const list=getWatchlist(),wrap=$.real("watchList");
@@ -4399,12 +4464,24 @@ async function renderWatchlist(){
       S.wlCache[item.id]={p:fp(q.price),pc:col,c:fpc(q.percent),cc:col};
     }
   });
+  // 排名模式：依橫斷面分數由強到弱排序顯示（未排名者沉底）
+  const displayList = (S.wlRankMode && S.wlScores)
+    ? [...list].sort((a,b)=>(S.wlScores[b.id]??-9)-(S.wlScores[a.id]??-9))
+    : list;
   wrap.innerHTML="";
-  list.forEach(item=>{
+  displayList.forEach((item,idx)=>{
     const div=document.createElement("div");
     div.className="list-item"+(item.id===S.stockId?" active":"");
     div.dataset.watchId=item.id;
-    div.innerHTML=`<div><div class="sym">${item.id}</div><div class="name">${item.name||STOCK_DIR[item.id]||""}</div></div><div style="display:flex;flex-direction:column;align-items:flex-end;gap:1px"><span class="pr" id="wlp_${item.id}">---</span><span class="pr-chg" id="wlc_${item.id}" style="color:var(--txt3)">---</span></div><button class="del" data-act="del-watch">✕</button>`;
+    const sc=S.wlScores?S.wlScores[item.id]:undefined;
+    let chip="";
+    if(sc!=null){
+      const c=sc>0.08?"var(--red)":sc<-0.08?"var(--green)":"var(--txt2)";
+      const t=sc>0.08?"偏多":sc<-0.08?"偏空":"觀望";
+      chip=`<span style="font-size:9px;font-family:var(--mono);color:${c};margin-left:5px">${t} ${sc>=0?"+":""}${sc.toFixed(2)}</span>`;
+    }
+    const rankNo = (S.wlRankMode&&sc!=null) ? `<span style="font-size:9px;color:var(--txt3);font-family:var(--mono);margin-right:4px">#${idx+1}</span>` : "";
+    div.innerHTML=`<div><div class="sym">${rankNo}${item.id}</div><div class="name">${item.name||STOCK_DIR[item.id]||""}${chip}</div></div><div style="display:flex;flex-direction:column;align-items:flex-end;gap:1px"><span class="pr" id="wlp_${item.id}">---</span><span class="pr-chg" id="wlc_${item.id}" style="color:var(--txt3)">---</span></div><button class="del" data-act="del-watch">✕</button>`;
     // 點擊行為由 #watchList 父層統一處理（見 bindEvents），這裡不再 addEventListener
     wrap.appendChild(div);
      // 立即從快取還原價格，避免閃爍為 ---
@@ -4418,7 +4495,7 @@ async function renderWatchlist(){
   if(S.watchInflight) return; // DOM 已更新且快取已還原，可安全提前返回
   S.watchInflight=true;
   try{
-    for(const item of list){
+    for(const item of displayList){
       try{
         const q=await fetchTWSELive(item.id);
         if(q){
@@ -4881,6 +4958,7 @@ function bindEvents(){
   $("wlAddBtn").addEventListener("click",()=>{const v=$("wlInput").value.trim();if(v){addWatch(v);$("wlInput").value="";}});
   $("wlInput").addEventListener("keydown",e=>{if(e.key==="Enter"){const v=$("wlInput").value.trim();if(v){addWatch(v);$("wlInput").value="";}}});
   $("wlRefreshBtn").addEventListener("click",renderWatchlist);
+  $("wlRankBtn").addEventListener("click",rankWatchlist);
 
   // 自選清單 / 警報 — 一次性事件委派（取代每次 render 重綁，杜絕監聽器累積）
   const wlEl=$.real("watchList");
@@ -5237,7 +5315,7 @@ async function runSelftest(silent=false){
     "ai-body","ai-badge",
     "search","searchBtn","search-suggest","search-wrap","watchBtn","exportBtn",
     "alertType","alertPrice","addAlertBtn","alertsList","alert-badge",
-    "watchList","wlInput","wlAddBtn","wlRefreshBtn","wl-count",
+    "watchList","wlInput","wlAddBtn","wlRefreshBtn","wlRankBtn","wl-count",
     "fetch-dot","fetch-label","log-body","log-count",
     "fmToken","groqKey","btBars","rtSec","saveCfgBtn","cancelCfgBtn","closeSettingsBtn","settingsBtn","overlay",
     "exportDataBtn","importDataBtn","importDataFile","autoReload","autoReloadTime",
